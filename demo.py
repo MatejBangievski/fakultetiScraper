@@ -1,6 +1,5 @@
 import time
 import json
-import re
 import os
 from datetime import datetime
 from selenium import webdriver
@@ -12,13 +11,29 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
 
-# --- CONFIGURATION ---
-DATA_FILE = "dataset_fakulteti.json"
+DATA_FILE = "dataset_fakulteti.jsonl"
+
+
+def log(message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}")
 
 
 def setup_driver():
     chrome_options = Options()
-    # chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_settings.stylesheets": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
@@ -26,163 +41,146 @@ def setup_driver():
 def clean_text(text):
     if not text: return ""
     text = text.replace("\r", "").replace("\t", " ")
-    text = re.sub(r'\n+', '\n', text)
-    text = re.sub(r' +', ' ', text)
-    return text.strip()
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    return "\n".join(lines)
 
 
-def load_existing_data():
-    """Loads existing JSON data so we can append to it and check for duplicates."""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+def get_category_markers():
+    markers = {}
+    if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0:
+        return markers
+    log("Scanning dataset for existing category markers...")
+    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
             try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return []
-    return []
+                item = json.loads(line)
+                markers[item["main_category"]] = item["link"]
+            except:
+                continue
+    return markers
 
 
-def get_all_category_links(driver):
-    driver.get("https://www.fakulteti.mk/")
+def get_all_category_links():
+    log("Fetching category links (Ostanato included)...")
+    driver = setup_driver()
     wait = WebDriverWait(driver, 10)
     category_urls = {}
 
-    menu_items = driver.find_elements(By.CSS_SELECTOR, ".menu-categories-container ul > li:not(#ostanato)")
-    for item in menu_items:
-        try:
-            link_el = item.find_element(By.TAG_NAME, "a")
-            name = link_el.text.strip()
-            url = link_el.get_attribute("href")
-            if url: category_urls[name] = url
-        except:
-            pass
-
     try:
-        ostanato_li = driver.find_element(By.ID, "ostanato")
-        ActionChains(driver).move_to_element(ostanato_li).perform()
-        time.sleep(1)
+        driver.get("https://www.fakulteti.mk/")
+        menu_items = driver.find_elements(By.CSS_SELECTOR, ".menu-categories-container ul > li:not(#ostanato)")
+        for item in menu_items:
+            try:
+                link_el = item.find_element(By.TAG_NAME, "a")
+                category_urls[link_el.text.strip()] = link_el.get_attribute("href")
+            except:
+                pass
 
-        tabs = driver.find_elements(By.CSS_SELECTOR, ".all-categories-tabs li")
-        for i in range(len(tabs)):
+        try:
             ostanato_li = driver.find_element(By.ID, "ostanato")
             ActionChains(driver).move_to_element(ostanato_li).perform()
-
-            current_tabs = driver.find_elements(By.CSS_SELECTOR, ".all-categories-tabs li")
-            tab_name = current_tabs[i].text.strip()
-            current_tabs[i].click()
             time.sleep(1)
-
-            first_post = driver.find_element(By.CSS_SELECTOR, ".tab-pane.active .category-latest-posts a")
-            first_post_url = first_post.get_attribute("href")
-
-            driver.execute_script(f"window.open('{first_post_url}', '_blank');")
-            driver.switch_to.window(driver.window_handles[1])
-
-            cat_link_el = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "post-category")))
-            category_urls[tab_name] = cat_link_el.get_attribute("href")
-
-            driver.close()
-            driver.switch_to.window(driver.window_handles[0])
-    except Exception as e:
-        print(f"Error when scraping 'Ostanato' tab: {e}")
-
+            tabs = driver.find_elements(By.CSS_SELECTOR, ".all-categories-tabs li")
+            for i in range(len(tabs)):
+                ActionChains(driver).move_to_element(driver.find_element(By.ID, "ostanato")).perform()
+                current_tab = driver.find_elements(By.CSS_SELECTOR, ".all-categories-tabs li")[i]
+                tab_name = current_tab.text.strip()
+                current_tab.click()
+                time.sleep(0.5)
+                first_post = driver.find_element(By.CSS_SELECTOR,
+                                                 ".tab-pane.active .category-latest-posts a").get_attribute("href")
+                driver.execute_script(f"window.open('{first_post}', '_blank');")
+                driver.switch_to.window(driver.window_handles[1])
+                category_urls[tab_name] = wait.until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "post-category"))).get_attribute("href")
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+        except Exception as e:
+            log(f"Ostanato Error: {e}")
+    finally:
+        driver.quit()
     return category_urls
 
 
-def scrape_category(driver, category_name, url, existing_urls, full_dataset):
-    print(f"\n--- Scraping Category: {category_name} ---")
+def scrape_category(driver, category_name, url, marker):
+    log(f"--- Category: {category_name} ---")
     driver.get(url)
-    wait = WebDriverWait(driver, 10)
+    wait = WebDriverWait(driver, 7)
 
-    # Step 1: Expand content but check if the newest visible posts are already scraped
-    # If the very first post on the page is already in our list, we might not need to expand at all.
 
+    click_count = 0
     while True:
-        # Check current visible links
-        visible_elements = driver.find_elements(By.CSS_SELECTOR, ".post-container a[href*='news']")
-        visible_links = [el.get_attribute("href") for el in visible_elements]
-
-        # If any of the visible links are already in our database, we stop clicking "Load More"
-        if any(link in existing_urls for link in visible_links):
-            print(f"  > Found existing posts in {category_name}. Stopping expansion.")
+        visible_links = [el.get_attribute("href") for el in
+                         driver.find_elements(By.CSS_SELECTOR, ".post-container a[href*='news']")]
+        if marker and marker in visible_links:
+            log(f"  [STOP] Marker reached.")
             break
-
         try:
             load_more = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-outline-blue")))
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more)
-            time.sleep(1)
+            before_count = len(driver.find_elements(By.CSS_SELECTOR, ".post-container"))
+            start_time = time.time()
             driver.execute_script("arguments[0].click();", load_more)
-            time.sleep(2)
+            wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ".post-container")) > before_count)
+            click_count += 1
+            log(f"  [CLICK {click_count}] Expanded in {time.time() - start_time:.2f}s")
         except:
             break
 
-    # Step 2: Get all links and filter
-    elements = driver.find_elements(By.CSS_SELECTOR, ".post-container a[href*='news']")
-    all_links = list(dict.fromkeys([el.get_attribute("href") for el in elements]))
 
-    for link in all_links:
-        if link in existing_urls:
-            print(f"  > Reached already scraped content at: {link}. Skipping remaining.")
-            break
+    all_elements = driver.find_elements(By.CSS_SELECTOR, ".post-container a[href*='news']")
+    new_links = []
+    for el in all_elements:
+        href = el.get_attribute("href")
+        if href == marker: break
+        if href not in new_links: new_links.append(href)
 
+    if not new_links:
+        log(f"  [SKIP] No new content.")
+        return
+
+
+    log(f"  [EXTRACT] Saving {len(new_links)} items...")
+    for link in reversed(new_links):
         data = extract_post_data(driver, link)
         if data:
             data["main_category"] = category_name
-            full_dataset.append(data)
-            existing_urls.add(link)
-            save_checkpoint(full_dataset)
+            with open(DATA_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+            print(f"    [+] {data['title'][:50]}...")
 
 
 def extract_post_data(driver, url):
     try:
         driver.get(url)
-        wait = WebDriverWait(driver, 10)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".single-post-title-wrapper h1")))
-
-        title = driver.find_element(By.CSS_SELECTOR, ".single-post-title-wrapper h1").get_attribute("innerText")
-        content_el = driver.find_element(By.CLASS_NAME, "single-post-content-container")
-        raw_content = content_el.get_attribute("innerText")
-
-        icons = driver.find_element(By.CLASS_NAME, "single-post-icons")
-        date = icons.find_element(By.CSS_SELECTOR, ".date span").text.strip()
-
-        tags_el = driver.find_elements(By.CSS_SELECTOR, ".tags-holder .single-post-tag")
-        tags = [t.text.strip() for t in tags_el]
+        wait = WebDriverWait(driver, 5)
+        wait.until(lambda d: d.find_element(By.TAG_NAME, "h1"))
 
         return {
             "link": url,
-            "title": clean_text(title),
-            "date": date,
-            "text": clean_text(raw_content),
-            "tags": tags,
+            "title": clean_text(driver.find_element(By.TAG_NAME, "h1").get_attribute("innerText")),
+            "date": driver.find_element(By.CSS_SELECTOR, ".date span").get_attribute("innerText").strip(),
+            "text": clean_text(
+                driver.find_element(By.CLASS_NAME, "single-post-content-container").get_attribute("innerText")),
+            "tags": [t.text.strip() for t in driver.find_elements(By.CSS_SELECTOR, ".single-post-tag")],
             "scraped_at": datetime.now().isoformat()
         }
     except:
         return None
 
 
-def save_checkpoint(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
 def main():
-    driver = setup_driver()
-    try:
-        # Load existing data from file
-        full_dataset = load_existing_data()
-        existing_urls = {post['link'] for post in full_dataset}
-        print(f"Loaded {len(existing_urls)} existing posts from {DATA_FILE}")
+    log("=== TURBO SCRAPER STARTING ===")
+    markers = get_category_markers()
+    categories = get_all_category_links()
 
-        all_categories = get_all_category_links(driver)
-        print(f"Found categories: {list(all_categories.keys())}")
+    for name, url in categories.items():
+        driver = setup_driver()
+        try:
+            scrape_category(driver, name, url, markers.get(name))
+        finally:
+            driver.quit()
 
-        for name, url in all_categories.items():
-            scrape_category(driver, name, url, existing_urls, full_dataset)
-
-        print(f"\nScraping finished. Total posts in database: {len(full_dataset)}")
-    finally:
-        driver.quit()
+    log("=== ALL CATEGORIES SYNCED ===")
 
 
 if __name__ == "__main__":
